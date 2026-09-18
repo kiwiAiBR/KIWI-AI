@@ -1,4 +1,6 @@
 import os
+import urllib.parse
+import random
 from flask import Flask, render_template, request, jsonify, session
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -54,6 +56,33 @@ MODEL_CONFIGS = {
         )
     }
 }
+
+# --- ENRIQUECEDOR INTELIGENTE DE PROMPTS MULTIMÍDIA ---
+
+def optimize_prompt(raw_prompt, media_type="image", style="realista"):
+    try:
+        enhancer_model = genai.GenerativeModel("gemini-3.5-flash-lite")
+        style_desc = {
+            "realista": "hyperrealistic photography, 8k, highly detailed, dramatic lighting, shot on 35mm lens, award-winning masterpiece",
+            "anime": "vibrant Japanese anime style, Makoto Shinkai aesthetic, gorgeous colors, dynamic composition, masterpiece",
+            "cyberpunk": "cyberpunk neon aesthetic, futuristic city, rain reflections, volumetric glow, high tech, blade runner vibes",
+            "3d": "Pixar / Disney 3D animation style, cute character, vibrant subsurface scattering, octane render, clean render",
+            "fantasia": "epic fantasy concept art, magical glowing runes, ethereal atmosphere, trending on Artstation"
+        }.get(style.lower(), "photorealistic, 8k resolution, cinematic lighting, masterpiece")
+        
+        prompt_instruction = (
+            f"You are a world-class AI prompt engineer for image and video synthesis. "
+            f"Translate and expand this user request into a rich, vivid English visual prompt for {media_type} generation. "
+            f"Style guidance: {style_desc}. "
+            f"Output ONLY the final English prompt text without quotes, commentary or explanations."
+        )
+        resp = enhancer_model.generate_content(f"{prompt_instruction}\n\nUser request: {raw_prompt}")
+        enhanced = resp.text.strip().replace('"', '').replace('\n', ' ')
+        if enhanced:
+            return enhanced
+    except Exception as e:
+        pass
+    return raw_prompt
 
 @app.route('/')
 def home():
@@ -152,6 +181,81 @@ def rename_conversation_route(conv_id):
     success = db.rename_conversation(conv_id, user_id, new_title)
     return jsonify({"success": success})
 
+# --- ROTAS DE GERAÇÃO DE MÍDIA (IMAGEM E VÍDEO) ---
+
+@app.route('/api/generate_image', methods=['POST'])
+def generate_image_api():
+    data = request.json or {}
+    prompt = data.get('prompt', '').strip()
+    style = data.get('style', 'realista')
+    aspect = data.get('aspect', 'square')
+    conv_id = data.get('conversation_id')
+    user_id = session.get('user_id')
+    
+    if not prompt:
+        return jsonify({"error": "O prompt da imagem é obrigatório."}), 400
+        
+    width, height = 1024, 1024
+    if aspect == 'landscape':
+        width, height = 1280, 720
+    elif aspect == 'portrait':
+        width, height = 720, 1280
+        
+    enhanced = optimize_prompt(prompt, "image", style)
+    encoded = urllib.parse.quote(enhanced)
+    seed = random.randint(1000, 9999999)
+    image_url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&nologo=true&seed={seed}"
+    
+    if user_id:
+        if not conv_id:
+            new_conv = db.create_conversation(user_id, title=f"🎨 {prompt[:24]}", model="Kiwi Studio Imagem")
+            conv_id = new_conv['id']
+            
+        db.add_message(conv_id, 'user', f"🎨 [Gerar Imagem]: {prompt}")
+        img_markdown = f"![{prompt}]({image_url})\n\n**Prompt:** *{prompt}*\n✨ *Prompt otimizado:* `{enhanced}`"
+        db.add_message(conv_id, 'kiwi', img_markdown, model_tag="Kiwi Studio Imagem")
+        
+    return jsonify({
+        "status": "ok",
+        "image_url": image_url,
+        "original_prompt": prompt,
+        "enhanced_prompt": enhanced,
+        "conversation_id": conv_id
+    })
+
+@app.route('/api/generate_video', methods=['POST'])
+def generate_video_api():
+    data = request.json or {}
+    prompt = data.get('prompt', '').strip()
+    style = data.get('style', 'cinematico')
+    conv_id = data.get('conversation_id')
+    user_id = session.get('user_id')
+    
+    if not prompt:
+        return jsonify({"error": "O prompt do vídeo é obrigatório."}), 400
+        
+    enhanced = optimize_prompt(prompt, "cinematic video scene with camera movement and motion", style)
+    encoded = urllib.parse.quote(enhanced)
+    seed = random.randint(1000, 9999999)
+    cover_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&nologo=true&seed={seed}"
+    
+    if user_id:
+        if not conv_id:
+            new_conv = db.create_conversation(user_id, title=f"🎬 {prompt[:24]}", model="Kiwi Studio Vídeo")
+            conv_id = new_conv['id']
+            
+        db.add_message(conv_id, 'user', f"🎬 [Gerar Vídeo]: {prompt}")
+        video_markdown = f"[VIDEO_PREVIEW:{cover_url}:{prompt}:{enhanced}]\n\n🎬 **Cena:** *{prompt}*\n🎥 *Direção e Movimento:* `{enhanced}`"
+        db.add_message(conv_id, 'kiwi', video_markdown, model_tag="Kiwi Studio Vídeo")
+        
+    return jsonify({
+        "status": "ok",
+        "cover_url": cover_url,
+        "original_prompt": prompt,
+        "enhanced_prompt": enhanced,
+        "conversation_id": conv_id
+    })
+
 # --- ROTA PRINCIPAL DE ENVIO DE MENSAGEM ---
 
 @app.route('/send', methods=['POST'])
@@ -178,14 +282,84 @@ def send_message():
         db.add_message(conv_id, 'user', user_message)
         db.update_conversation_title_if_default(conv_id, user_message)
 
-    # Configura o modelo escolhido
+    lower_msg = user_message.lower()
+
+    # DETECÇÃO AUTOMÁTICA DE PEDIDO DE IMAGEM NO CHAT
+    image_triggers = ["desenhe", "desenha", "crie uma imagem", "faça uma imagem", "gere uma imagem", "gerar imagem", "cria uma imagem", "faça um desenho"]
+    is_image_request = any(lower_msg.startswith(t) for t in image_triggers)
+
+    # DETECÇÃO AUTOMÁTICA DE PEDIDO DE VÍDEO NO CHAT
+    video_triggers = ["crie um vídeo", "crie um video", "faça um vídeo", "faça um video", "gere um vídeo", "gere um video", "gerar vídeo", "gerar video"]
+    is_video_request = any(lower_msg.startswith(t) for t in video_triggers)
+
+    if is_image_request:
+        clean_prompt = user_message
+        for t in image_triggers:
+            if clean_prompt.lower().startswith(t):
+                clean_prompt = clean_prompt[len(t):].strip(" :,-")
+                break
+        if not clean_prompt:
+            clean_prompt = user_message
+            
+        enhanced = optimize_prompt(clean_prompt, "image", "realista")
+        encoded = urllib.parse.quote(enhanced)
+        seed = random.randint(1000, 9999999)
+        img_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&nologo=true&seed={seed}"
+        
+        response_text = (
+            f"Aqui está a imagem que criei para você!\n\n"
+            f"![{clean_prompt}]({img_url})\n\n"
+            f"**Descrição:** *{clean_prompt}*\n"
+            f"✨ *Prompt detalhado utilizado:* `{enhanced}`"
+        )
+        
+        if user_id and conv_id:
+            db.add_message(conv_id, 'kiwi', response_text, model_tag="Kiwi Studio Imagem")
+            
+        return jsonify({
+            "response": response_text,
+            "model_used": "Kiwi Studio Imagem",
+            "conversation_id": conv_id,
+            "image_url": img_url
+        })
+
+    if is_video_request:
+        clean_prompt = user_message
+        for t in video_triggers:
+            if clean_prompt.lower().startswith(t):
+                clean_prompt = clean_prompt[len(t):].strip(" :,-")
+                break
+        if not clean_prompt:
+            clean_prompt = user_message
+            
+        enhanced = optimize_prompt(clean_prompt, "cinematic video scene with camera movement and motion", "cinematico")
+        encoded = urllib.parse.quote(enhanced)
+        seed = random.randint(1000, 9999999)
+        cover_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&nologo=true&seed={seed}"
+        
+        response_text = (
+            f"Aqui está o clipe cinematográfico que gerei para você!\n\n"
+            f"[VIDEO_PREVIEW:{cover_url}:{clean_prompt}:{enhanced}]\n\n"
+            f"🎬 **Cena:** *{clean_prompt}*\n"
+            f"🎥 *Direção e Movimento:* `{enhanced}`"
+        )
+        
+        if user_id and conv_id:
+            db.add_message(conv_id, 'kiwi', response_text, model_tag="Kiwi Studio Vídeo")
+            
+        return jsonify({
+            "response": response_text,
+            "model_used": "Kiwi Studio Vídeo",
+            "conversation_id": conv_id,
+            "cover_url": cover_url
+        })
+
+    # Resposta de Chat Padrão (LLM)
     config = MODEL_CONFIGS.get(selected_model, MODEL_CONFIGS["gemini-3.5-flash-lite"])
     
-    # Reconstrói histórico de mensagens para a IA lembrar de tudo
     history = []
     if conv_id:
         prev_msgs = db.get_conversation_messages(conv_id)
-        # Pega as mensagens anteriores (exceto a última que acabamos de adicionar)
         for m in prev_msgs[:-1]:
             role = 'user' if m['sender'] == 'user' else 'model'
             history.append({"role": role, "parts": [m['content']]})
@@ -199,7 +373,6 @@ def send_message():
         response = chat.send_message(user_message)
         response_text = response.text
         
-        # Salva a resposta da Kiwi se estiver com conversa ativa
         if user_id and conv_id:
             db.add_message(conv_id, 'kiwi', response_text, model_tag=config['name'])
             
@@ -209,7 +382,6 @@ def send_message():
             "conversation_id": conv_id
         })
     except Exception as e:
-        # Fallback de segurança para gemini-3.5-flash-lite caso o modelo dê erro de cota
         try:
             fb_config = MODEL_CONFIGS["gemini-3.5-flash-lite"]
             fb_model = genai.GenerativeModel(
@@ -233,7 +405,7 @@ def send_message():
 
 if __name__ == '__main__':
     print("=========================================================")
-    print("🥝 Kiwi AI Server com Autenticação e Banco de Dados!")
+    print("🥝 Kiwi AI Studio (Chat, Imagens, Vídeos e Autenticação)!")
     print("Acesse: http://localhost:5000")
     print("=========================================================")
     port = int(os.environ.get("PORT", 5000))
